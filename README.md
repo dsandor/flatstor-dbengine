@@ -11,37 +11,51 @@ A high-performance database engine for querying massively wide datasets (10,000+
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                      Client Layer                           │
-│                   CLI Interface / API                       │
-└─────────────────────┬───────────────────────────────────────┘
-                      │
-┌─────────────────────▼───────────────────────────────────────┐
-│                Query Translation Layer                      │
-│         SQL Parser (Column Group Syntax)                    │
-│         Query Translator (Expands to DuckDB SQL)            │
-└─────────────────────┬───────────────────────────────────────┘
-                      │
-┌─────────────────────▼───────────────────────────────────────┐
-│                    DuckDB Engine                            │
-│              Embedded DuckDB (Query Execution)              │
-└─────────────────────┬───────────────────────────────────────┘
-                      │
-┌─────────────────────▼───────────────────────────────────────┐
-│                Column Group Manager                         │
-│         Column Group Registry / Row Assembler               │
-└─────────────────────┬───────────────────────────────────────┘
-                      │
-┌─────────────────────▼───────────────────────────────────────┐
-│                 Storage Abstraction                         │
-│              Disk Storage / S3 Storage (Future)             │
-└─────────────────────┬───────────────────────────────────────┘
-                      │
-┌─────────────────────▼───────────────────────────────────────┐
-│                   Data Files (JSON)                         │
-│     _schema.json / Row JSON Files / Per column group        │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph Client["Client Layer"]
+        CLI["CLI Interface"]
+        API["HTTP API Server"]
+        GoClient["Go Client"]
+        PyClient["Python Client"]
+    end
+
+    subgraph Query["Query Translation Layer"]
+        Parser["SQL Parser<br/>(Column Group Syntax)"]
+        Translator["Query Translator<br/>(Expands to DuckDB SQL)"]
+    end
+
+    subgraph Engine["DuckDB Engine"]
+        DuckDB["Embedded DuckDB<br/>(Query Execution)"]
+    end
+
+    subgraph ColGroup["Column Group Manager"]
+        Registry["Column Group Registry"]
+        Assembler["Row Assembler"]
+    end
+
+    subgraph Storage["Storage Abstraction"]
+        Disk["Disk Storage"]
+        S3["S3 Storage<br/>(Future)"]
+    end
+
+    subgraph Data["Data Files (JSON)"]
+        Schema["_schema.json"]
+        RowFiles["Row JSON Files<br/>(Per column group)"]
+    end
+
+    GoClient --> API
+    PyClient --> API
+    CLI --> Parser
+    API --> Parser
+    Parser --> Translator
+    Translator --> DuckDB
+    DuckDB --> Registry
+    Registry --> Assembler
+    Assembler --> Disk
+    Assembler -.-> S3
+    Disk --> Schema
+    Disk --> RowFiles
 ```
 
 ## Project Structure
