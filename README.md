@@ -429,6 +429,122 @@ This represents a **40-90x improvement** in authentication and connection overhe
 
 ## Data Storage
 
+### Wide Column Architecture
+
+The following diagram illustrates how massively wide datasets (10,000+ columns) are organized into column groups and stored as separate JSON files per row:
+
+```mermaid
+flowchart TB
+    subgraph QueryLayer["Query Layer"]
+        Query["SELECT Bloomberg.ISIN, ICE.Ticker<br/>FROM assets<br/>WHERE Bloomberg.Ticker = 'AAPL'"]
+    end
+
+    subgraph Translation["Query Translation"]
+        Translator["Column Group Translator"]
+        DuckSQL["SELECT Bloomberg_ISIN, ICE_Ticker<br/>FROM assets<br/>WHERE Bloomberg_Ticker = 'AAPL'"]
+    end
+
+    subgraph LogicalView["Logical View (Flattened Wide Table)"]
+        subgraph Headers["Column Headers (10,000+ columns possible)"]
+            H1["_row_id"]
+            H2["Common_<br/>InstrumentID"]
+            H3["Bloomberg_<br/>ISIN"]
+            H4["Bloomberg_<br/>Ticker"]
+            H5["Bloomberg_<br/>BBGLOBAL"]
+            H6["ICE_<br/>ISIN"]
+            H7["ICE_<br/>Ticker"]
+            H8["..."]
+        end
+    end
+
+    subgraph PhysicalStorage["Physical Storage (Per-Row JSON Files)"]
+        subgraph Row1["Row: abc123_guid/"]
+            R1Common["Common.json<br/>{InstrumentID: 'abc123'}"]
+            R1Bloomberg["Bloomberg.json<br/>{ISIN: 'AAA1',<br/>Ticker: 'AAPL',<br/>BBGLOBAL: 'AAA1BBG'}"]
+            R1ICE["ICE.json<br/>{ISIN: 'AAA1',<br/>Ticker: 'AAPL-US'}"]
+        end
+
+        subgraph Row2["Row: def456_guid/"]
+            R2Common["Common.json<br/>{InstrumentID: 'def456'}"]
+            R2Bloomberg["Bloomberg.json<br/>{ISIN: 'BBB2',<br/>Ticker: 'MSFT',<br/>BBGLOBAL: 'BBB2BBG'}"]
+            R2ICE["ICE.json<br/>{ISIN: 'BBB2',<br/>Ticker: 'MSFT-US'}"]
+        end
+    end
+
+    Query --> Translator
+    Translator --> DuckSQL
+    DuckSQL --> LogicalView
+    LogicalView --> PhysicalStorage
+```
+
+### Column Group Concept
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                           SINGLE ROW (abc123_guid)                                   │
+├─────────────────┬───────────────────────────┬───────────────────────────┬───────────┤
+│  Common Group   │     Bloomberg Group       │       ICE Group           │    ...    │
+│  (1 column)     │     (50 columns)          │       (30 columns)        │ (N groups)│
+├─────────────────┼───────────────────────────┼───────────────────────────┼───────────┤
+│ InstrumentID    │ ISIN, Ticker, BBGLOBAL,   │ ISIN, Ticker, Exchange,   │           │
+│                 │ Currency, Price, Volume,  │ Region, AssetClass,       │           │
+│                 │ MarketCap, Sector, ...    │ Liquidity, Rating, ...    │           │
+├─────────────────┼───────────────────────────┼───────────────────────────┼───────────┤
+│                 │                           │                           │           │
+│  Common.json    │     Bloomberg.json        │       ICE.json            │   ....    │
+│  (1 file)       │     (1 file)              │       (1 file)            │           │
+└─────────────────┴───────────────────────────┴───────────────────────────┴───────────┘
+
+Benefits of Column Group Storage:
+• Update Bloomberg data without touching ICE data
+• Add new data sources (column groups) without schema migration
+• Query only the column groups you need
+• Human-readable JSON files for debugging
+• O(1) row lookup by ID
+```
+
+### Query Flow with Column Groups
+
+```
+User Query:                                    Physical File Access:
+─────────────────────────────────────────      ─────────────────────────────────────
+SELECT Bloomberg.ISIN,
+       Bloomberg.Ticker,                  ──►  Only reads Bloomberg.json
+       ICE.Ticker                              and ICE.json per matching row
+FROM assets                                    (skips Common.json and other groups)
+WHERE Bloomberg.Ticker = 'AAPL'
+
+                    │
+                    ▼
+            ┌───────────────┐
+            │ Query Parser  │
+            │ (Column Group │
+            │   Syntax)     │
+            └───────┬───────┘
+                    │
+                    ▼
+            ┌───────────────┐
+            │  Translator   │
+            │ Bloomberg.ISIN│
+            │      ▼        │
+            │ Bloomberg_ISIN│
+            └───────┬───────┘
+                    │
+                    ▼
+            ┌───────────────┐
+            │    DuckDB     │
+            │  (Execution)  │
+            └───────┬───────┘
+                    │
+                    ▼
+            ┌───────────────┐
+            │    Result     │
+            │ Bloomberg_ISIN│
+            │ Bloomberg_... │
+            │ ICE_Ticker    │
+            └───────────────┘
+```
+
 ### JSON File Format
 
 Each row is stored as multiple JSON files, one per column group:
@@ -651,4 +767,11 @@ Goodbye!
 
 ## License
 
-[Add license information here]
+This project uses a **Source Available License** with the following terms:
+
+- **Non-Commercial Use**: Free for personal, educational, academic, research, and non-profit use
+- **Commercial Use**: Requires a paid annual license agreement
+
+See [LICENSE.md](LICENSE.md) for full details.
+
+For commercial licensing inquiries, contact the repository owner.
