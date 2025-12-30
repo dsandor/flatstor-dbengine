@@ -1,0 +1,43 @@
+.claude
+mydata
+data
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+dbengine
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Go workspace file
+go.work
+go.work.sum
+
+# Dependency directories
+vendor/
+
+# DuckDB database files
+*.duckdb
+*.duckdb.wal
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Test results and logs
+results.json
+*.log
+
+# Environment files
+.env
+.env.local
