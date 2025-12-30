@@ -6,9 +6,13 @@ Usage:
     python generate_data.py --rows 1000 --columns 100
     python generate_data.py --rows 100 --columns 10000 --groups 50
     python generate_data.py --rows 10 --columns 20 --table my_table
+
+For large datasets (to avoid memory issues), use batch mode:
+    python generate_data.py --rows 500000 --columns 2000 --batch-size 1000
 """
 
 import argparse
+import gc
 import json
 import os
 import random
@@ -119,8 +123,42 @@ def generate_schema(table_name: str, num_columns: int, num_groups: int) -> dict:
     }
 
 
+def generate_and_write_row_streaming(data_path: Path, table_name: str, schema: dict):
+    """Generate and write a row directly to disk without holding full row in memory."""
+    row_id = str(uuid.uuid4())
+    row_dir = data_path / table_name / row_id
+    row_dir.mkdir(parents=True, exist_ok=True)
+
+    for group in schema["column_groups"]:
+        group_name = group["name"]
+        group_file = row_dir / f"{group_name}.json"
+
+        # Write directly to file using a streaming approach
+        with open(group_file, 'w') as f:
+            f.write('{\n')
+            first = True
+            for col in group["columns"]:
+                col_name = col["name"]
+                col_type = col["type"]
+
+                if not first:
+                    f.write(',\n')
+                first = False
+
+                if col_name == "InstrumentID":
+                    value = row_id
+                else:
+                    value = random_value(col_type)
+
+                # Write key-value pair
+                f.write(f'  "{col_name}": {json.dumps(value)}')
+            f.write('\n}')
+
+    return row_id
+
+
 def generate_row(schema: dict) -> dict:
-    """Generate a single row of data based on the schema."""
+    """Generate a single row of data based on the schema (legacy, memory-intensive)."""
     row_id = str(uuid.uuid4())
     groups = {}
 
@@ -143,6 +181,41 @@ def generate_row(schema: dict) -> dict:
         "_id": row_id,
         "groups": groups
     }
+
+
+def generate_batch_streaming(data_path: Path, table_name: str, schema: dict, batch_num: int, batch_size: int):
+    """Generate a batch of rows and write to batched files."""
+    batch_dir = data_path / table_name / f"batch_{batch_num:06d}"
+    batch_dir.mkdir(parents=True, exist_ok=True)
+
+    # Generate row IDs upfront
+    row_ids = [str(uuid.uuid4()) for _ in range(batch_size)]
+
+    # Write each group's data for all rows in the batch to a single file
+    for group in schema["column_groups"]:
+        group_name = group["name"]
+        group_file = batch_dir / f"{group_name}.jsonl"
+
+        with open(group_file, 'w') as f:
+            for row_idx, row_id in enumerate(row_ids):
+                row_data = {}
+                for col in group["columns"]:
+                    col_name = col["name"]
+                    col_type = col["type"]
+
+                    if col_name == "InstrumentID":
+                        row_data[col_name] = row_id
+                    else:
+                        row_data[col_name] = random_value(col_type)
+
+                # Add row ID for reference
+                row_data["_row_id"] = row_id
+                f.write(json.dumps(row_data) + '\n')
+
+                # Clear row_data to help GC
+                row_data = None
+
+    return row_ids
 
 
 def write_schema(data_path: Path, schema: dict):
@@ -211,6 +284,13 @@ def main():
         default=None,
         help="Random seed for reproducible data"
     )
+    parser.add_argument(
+        "--batch-size", "-b",
+        type=int,
+        default=1,
+        help="Number of rows per batch file (default: 1, one file per row). "
+             "Use higher values like 1000 for large datasets to reduce file count."
+    )
 
     args = parser.parse_args()
 
@@ -245,19 +325,49 @@ def main():
     print(f"  Total columns created: {total_cols}")
     print()
 
-    # Generate rows
+    # Generate rows using streaming to minimize memory usage
     print(f"Generating {args.rows:,} rows...")
+    if args.batch_size > 1:
+        print(f"  Using batch mode: {args.batch_size} rows per batch file")
     start_time = datetime.now()
 
-    for i in range(args.rows):
-        row = generate_row(schema)
-        write_row(data_path, args.table, row)
+    if args.batch_size > 1:
+        # Batch mode: write multiple rows per file to reduce file count
+        num_batches = (args.rows + args.batch_size - 1) // args.batch_size
+        rows_generated = 0
 
-        # Progress update every 100 rows or 10%
-        if (i + 1) % max(100, args.rows // 10) == 0:
-            elapsed = (datetime.now() - start_time).total_seconds()
-            rate = (i + 1) / elapsed if elapsed > 0 else 0
-            print(f"  {i + 1:,} / {args.rows:,} rows ({rate:.1f} rows/sec)")
+        for batch_num in range(num_batches):
+            # Calculate actual batch size (last batch may be smaller)
+            current_batch_size = min(args.batch_size, args.rows - rows_generated)
+
+            generate_batch_streaming(data_path, args.table, schema, batch_num, current_batch_size)
+            rows_generated += current_batch_size
+
+            # Garbage collection after each batch
+            gc.collect()
+
+            # Progress update
+            if (batch_num + 1) % max(1, num_batches // 20) == 0 or batch_num == num_batches - 1:
+                elapsed = (datetime.now() - start_time).total_seconds()
+                rate = rows_generated / elapsed if elapsed > 0 else 0
+                print(f"  {rows_generated:,} / {args.rows:,} rows ({rate:.1f} rows/sec)")
+    else:
+        # Single row mode: one file per row (original behavior, streaming)
+        gc_interval = max(1000, args.rows // 100)
+        progress_interval = max(100, args.rows // 10)
+
+        for i in range(args.rows):
+            generate_and_write_row_streaming(data_path, args.table, schema)
+
+            # Periodic garbage collection to prevent memory buildup
+            if (i + 1) % gc_interval == 0:
+                gc.collect()
+
+            # Progress update
+            if (i + 1) % progress_interval == 0:
+                elapsed = (datetime.now() - start_time).total_seconds()
+                rate = (i + 1) / elapsed if elapsed > 0 else 0
+                print(f"  {i + 1:,} / {args.rows:,} rows ({rate:.1f} rows/sec)")
 
     elapsed = (datetime.now() - start_time).total_seconds()
     print()
