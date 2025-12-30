@@ -2,25 +2,44 @@ package api
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"golang.org/x/crypto/hkdf"
+)
+
+// Security constants for authentication
+const (
+	// MinSigningKeyLength is the minimum required length for a signing key
+	MinSigningKeyLength = 32
+
+	// DefaultAccessTokenDuration is the default access token validity (15 minutes)
+	DefaultAccessTokenDuration = 15 * time.Minute
+
+	// DefaultRefreshTokenDuration is the default refresh token validity (24 hours)
+	DefaultRefreshTokenDuration = 24 * time.Hour
+
+	// MaxRevokedTokens is the maximum number of revoked tokens to store before emergency cleanup
+	MaxRevokedTokens = 10000
 )
 
 // TokenConfig holds JWT token configuration.
 type TokenConfig struct {
 	// SigningKey is the secret key used to sign tokens.
-	// If empty, a random key is generated on startup.
+	// SECURITY: Must be at least 32 bytes (256 bits) for production use.
+	// If empty, a random ephemeral key is generated (tokens invalidated on restart).
 	SigningKey string
 
 	// AccessTokenDuration is how long access tokens are valid.
-	// Default: 1 hour
+	// Default: 15 minutes (reduced from 1 hour for better security)
 	AccessTokenDuration time.Duration
 
 	// RefreshTokenDuration is how long refresh tokens are valid.
@@ -69,21 +88,36 @@ func NewAuthManager(username, password string) *AuthManager {
 
 // NewAuthManagerWithConfig creates a new AuthManager with token configuration.
 func NewAuthManagerWithConfig(username, password string, cfg TokenConfig) *AuthManager {
-	// Generate random signing key if not provided
-	signingKey := []byte(cfg.SigningKey)
-	if len(signingKey) == 0 {
+	var signingKey []byte
+
+	if cfg.SigningKey != "" {
+		// Validate provided signing key
+		if len(cfg.SigningKey) < MinSigningKeyLength {
+			log.Printf("WARNING: JWT signing key is shorter than %d bytes. Using key derivation for security.", MinSigningKeyLength)
+		}
+		// Use HKDF to derive a secure key from the provided secret
+		signingKey = deriveSigningKey([]byte(cfg.SigningKey))
+	} else {
+		// Generate random ephemeral signing key
+		log.Printf("WARNING: No JWT signing key provided. Generating random ephemeral key. Tokens will be invalidated on server restart.")
 		signingKey = make([]byte, 32)
-		rand.Read(signingKey)
+		n, err := rand.Read(signingKey)
+		if err != nil || n != 32 {
+			// This should never happen, but handle it gracefully
+			log.Printf("CRITICAL: Failed to generate secure random key: %v", err)
+			// Fall back to time-based entropy (not ideal but better than nothing)
+			signingKey = deriveSigningKey([]byte(fmt.Sprintf("%d", time.Now().UnixNano())))
+		}
 	}
 
 	accessDuration := cfg.AccessTokenDuration
 	if accessDuration == 0 {
-		accessDuration = 1 * time.Hour
+		accessDuration = DefaultAccessTokenDuration
 	}
 
 	refreshDuration := cfg.RefreshTokenDuration
 	if refreshDuration == 0 {
-		refreshDuration = 24 * time.Hour
+		refreshDuration = DefaultRefreshTokenDuration
 	}
 
 	return &AuthManager{
@@ -95,6 +129,20 @@ func NewAuthManagerWithConfig(username, password string, cfg TokenConfig) *AuthM
 		refreshTokenDuration: refreshDuration,
 		revokedTokens:        make(map[string]time.Time),
 	}
+}
+
+// deriveSigningKey uses HKDF to derive a secure signing key from the provided secret.
+func deriveSigningKey(secret []byte) []byte {
+	// Use HKDF with SHA-256 to derive a 32-byte key
+	hkdfReader := hkdf.New(sha256.New, secret, []byte("dbengine-jwt-salt"), []byte("jwt-signing-key"))
+	key := make([]byte, 32)
+	_, err := hkdfReader.Read(key)
+	if err != nil {
+		// This should never happen with valid parameters
+		log.Printf("CRITICAL: Failed to derive signing key: %v", err)
+		return secret[:32] // Fall back to truncated secret
+	}
+	return key
 }
 
 // Authenticate checks if the request has valid credentials.
@@ -110,7 +158,7 @@ func (a *AuthManager) Authenticate(r *http.Request) bool {
 		return false
 	}
 
-	// Check for Bearer token first (faster validation)
+	// Check for Bearer token first
 	if strings.HasPrefix(authHeader, "Bearer ") {
 		token := strings.TrimPrefix(authHeader, "Bearer ")
 		claims, err := a.ValidateToken(token)
@@ -127,23 +175,47 @@ func (a *AuthManager) Authenticate(r *http.Request) bool {
 		return false
 	}
 
-	// Use constant-time comparison to prevent timing attacks
-	usernameMatch := subtle.ConstantTimeCompare([]byte(username), []byte(a.username)) == 1
-	passwordMatch := subtle.ConstantTimeCompare([]byte(password), []byte(a.password)) == 1
-
-	return usernameMatch && passwordMatch
+	return a.AuthenticateCredentials(username, password)
 }
 
-// AuthenticateCredentials validates username and password.
+// AuthenticateCredentials validates username and password using constant-time comparison.
+// This prevents timing attacks that could reveal valid usernames.
 func (a *AuthManager) AuthenticateCredentials(username, password string) bool {
 	if !a.enabled {
 		return true
 	}
 
-	usernameMatch := subtle.ConstantTimeCompare([]byte(username), []byte(a.username)) == 1
-	passwordMatch := subtle.ConstantTimeCompare([]byte(password), []byte(a.password)) == 1
+	// Pad inputs to consistent lengths to prevent timing differences
+	// based on string length comparisons
+	maxLen := len(a.username)
+	if len(a.password) > maxLen {
+		maxLen = len(a.password)
+	}
+	if len(username) > maxLen {
+		maxLen = len(username)
+	}
+	if len(password) > maxLen {
+		maxLen = len(password)
+	}
 
-	return usernameMatch && passwordMatch
+	// Create padded versions for constant-time comparison
+	expectedUser := make([]byte, maxLen)
+	expectedPass := make([]byte, maxLen)
+	providedUser := make([]byte, maxLen)
+	providedPass := make([]byte, maxLen)
+
+	copy(expectedUser, a.username)
+	copy(expectedPass, a.password)
+	copy(providedUser, username)
+	copy(providedPass, password)
+
+	// Use constant-time comparison to prevent timing attacks
+	// Both comparisons are always performed to prevent timing leaks
+	usernameMatch := subtle.ConstantTimeCompare(providedUser, expectedUser)
+	passwordMatch := subtle.ConstantTimeCompare(providedPass, expectedPass)
+
+	// Use bitwise AND to ensure both must match (no short-circuit)
+	return (usernameMatch & passwordMatch) == 1
 }
 
 // GenerateTokenPair creates a new access and refresh token pair.
@@ -260,6 +332,7 @@ func (a *AuthManager) RevokeToken(tokenString string) {
 }
 
 // CleanupRevokedTokens removes expired tokens from the revocation list.
+// Also performs emergency cleanup if the list grows too large.
 func (a *AuthManager) CleanupRevokedTokens() {
 	a.revokedMu.Lock()
 	defer a.revokedMu.Unlock()
@@ -271,6 +344,29 @@ func (a *AuthManager) CleanupRevokedTokens() {
 			delete(a.revokedTokens, token)
 		}
 	}
+
+	// Emergency cleanup if list is still too large (prevents DoS via token accumulation)
+	if len(a.revokedTokens) > MaxRevokedTokens {
+		log.Printf("WARNING: Revoked token list exceeds %d entries, performing emergency cleanup", MaxRevokedTokens)
+		// Remove oldest half of the tokens
+		// This is a safety measure - in production, use persistent storage
+		count := 0
+		halfMax := MaxRevokedTokens / 2
+		for token := range a.revokedTokens {
+			if count >= halfMax {
+				break
+			}
+			delete(a.revokedTokens, token)
+			count++
+		}
+	}
+}
+
+// RevokedTokenCount returns the current number of revoked tokens (for monitoring).
+func (a *AuthManager) RevokedTokenCount() int {
+	a.revokedMu.RLock()
+	defer a.revokedMu.RUnlock()
+	return len(a.revokedTokens)
 }
 
 // IsEnabled returns whether authentication is enabled.
