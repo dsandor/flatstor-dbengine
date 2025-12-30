@@ -1,0 +1,34 @@
+# Git
+.git
+.gitignore
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# Build artifacts
+*.exe
+dbengine
+
+# Data directories (can be mounted as volumes)
+data/
+*.duckdb
+
+# Documentation
+*.md
+!README.md
+LICENSE*
+
+# Test files
+*_test.go
+**/*_test.go
+
+# Python cache
+__pycache__/
+*.pyc
+
+# OS files
+.DS_Store
+Thumbs.db

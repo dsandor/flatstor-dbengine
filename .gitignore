@@ -7,7 +7,7 @@ data
 *.dll
 *.so
 *.dylib
-dbengine
+/dbengine
 
 # Test binary, built with `go test -c`
 *.test
