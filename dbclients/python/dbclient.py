@@ -1,13 +1,17 @@
 """
 dbengine Python Client
 
-A Python client for the dbengine HTTP API that provides database connectivity
-similar to standard database drivers.
+A Python client for the dbengine HTTP API with connection pooling and JWT token caching.
+
+Features:
+- Connection pooling for high performance
+- JWT token authentication with automatic refresh
+- DB-API 2.0 compatible interface
 
 Example usage:
     from dbclient import connect
 
-    # Connect to the database
+    # Connect to the database (uses token auth by default)
     conn = connect("http://localhost:8080", username="admin", password="secret")
 
     # Execute a query
@@ -21,12 +25,14 @@ Example usage:
 """
 
 import json
-from typing import Any, Dict, List, Optional, Tuple, Union
+import threading
+import time
+from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from urllib.parse import urljoin, quote
 import http.client
 import base64
-import ssl
+import socket
 
 
 class Error(Exception):
@@ -126,6 +132,144 @@ class ExecuteResult:
     message: str
     rows_affected: int
     execution_ms: int
+
+
+class ConnectionPool:
+    """
+    HTTP connection pool for efficient connection reuse.
+
+    Maintains a pool of persistent HTTP connections to avoid
+    the overhead of establishing new connections for each request.
+    """
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        use_ssl: bool = False,
+        max_connections: int = 10,
+        timeout: float = 30.0,
+    ):
+        self._host = host
+        self._port = port
+        self._use_ssl = use_ssl
+        self._max_connections = max_connections
+        self._timeout = timeout
+        self._pool: List[http.client.HTTPConnection] = []
+        self._lock = threading.Lock()
+
+    def get_connection(self) -> http.client.HTTPConnection:
+        """Get a connection from the pool or create a new one."""
+        with self._lock:
+            if self._pool:
+                conn = self._pool.pop()
+                # Test if connection is still valid
+                try:
+                    conn.sock.setblocking(False)
+                    try:
+                        data = conn.sock.recv(1)
+                        if not data:
+                            # Connection closed by server
+                            conn.close()
+                            conn = None
+                    except (socket.error, BlockingIOError):
+                        # No data available, connection is good
+                        conn.sock.setblocking(True)
+                except (socket.error, AttributeError, OSError):
+                    conn = None
+
+                if conn is not None:
+                    return conn
+
+        # Create new connection
+        if self._use_ssl:
+            conn = http.client.HTTPSConnection(
+                self._host, self._port, timeout=self._timeout
+            )
+        else:
+            conn = http.client.HTTPConnection(
+                self._host, self._port, timeout=self._timeout
+            )
+        return conn
+
+    def return_connection(self, conn: http.client.HTTPConnection) -> None:
+        """Return a connection to the pool."""
+        with self._lock:
+            if len(self._pool) < self._max_connections:
+                self._pool.append(conn)
+            else:
+                conn.close()
+
+    def close_all(self) -> None:
+        """Close all connections in the pool."""
+        with self._lock:
+            for conn in self._pool:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            self._pool.clear()
+
+
+class TokenManager:
+    """
+    Manages JWT token authentication with automatic refresh.
+
+    - Caches access and refresh tokens
+    - Automatically refreshes tokens before expiry
+    - Thread-safe token access
+    """
+
+    def __init__(
+        self,
+        refresh_threshold: float = 300.0,  # 5 minutes before expiry
+    ):
+        self._access_token: Optional[str] = None
+        self._refresh_token: Optional[str] = None
+        self._expires_at: float = 0
+        self._refresh_threshold = refresh_threshold
+        self._lock = threading.RLock()
+
+    def set_tokens(
+        self,
+        access_token: str,
+        refresh_token: str,
+        expires_at: int,
+    ) -> None:
+        """Set tokens from login/refresh response."""
+        with self._lock:
+            self._access_token = access_token
+            self._refresh_token = refresh_token
+            self._expires_at = float(expires_at)
+
+    def get_access_token(self) -> Optional[str]:
+        """Get the current access token."""
+        with self._lock:
+            return self._access_token
+
+    def get_refresh_token(self) -> Optional[str]:
+        """Get the current refresh token."""
+        with self._lock:
+            return self._refresh_token
+
+    def needs_refresh(self) -> bool:
+        """Check if the token needs to be refreshed."""
+        with self._lock:
+            if not self._access_token:
+                return True
+            return time.time() + self._refresh_threshold >= self._expires_at
+
+    def has_token(self) -> bool:
+        """Check if we have a valid token."""
+        with self._lock:
+            return self._access_token is not None
+
+    def clear(self) -> None:
+        """Clear all tokens."""
+        with self._lock:
+            self._access_token = None
+            self._refresh_token = None
+            self._expires_at = 0
 
 
 class Cursor:
@@ -268,7 +412,12 @@ class Cursor:
 
 class Connection:
     """
-    Database connection to dbengine.
+    Database connection to dbengine with connection pooling and token caching.
+
+    Features:
+    - Connection pooling for efficient HTTP connection reuse
+    - JWT token authentication with automatic refresh
+    - Thread-safe operation
 
     Implements a subset of the Python DB-API 2.0 specification.
     """
@@ -281,6 +430,10 @@ class Connection:
         password: Optional[str] = None,
         use_ssl: bool = False,
         timeout: float = 30.0,
+        use_token_auth: bool = True,
+        auto_refresh: bool = True,
+        refresh_threshold: float = 300.0,
+        max_connections: int = 10,
     ):
         """
         Initialize a connection to dbengine.
@@ -288,10 +441,14 @@ class Connection:
         Args:
             host: The hostname or IP address
             port: The port number
-            username: Optional username for authentication
-            password: Optional password for authentication
+            username: Username for authentication
+            password: Password for authentication
             use_ssl: Whether to use HTTPS
             timeout: Request timeout in seconds
+            use_token_auth: Use JWT tokens instead of Basic Auth (default: True)
+            auto_refresh: Automatically refresh tokens before expiry (default: True)
+            refresh_threshold: Seconds before expiry to trigger refresh (default: 300)
+            max_connections: Maximum pooled connections (default: 10)
         """
         self._host = host
         self._port = port
@@ -301,12 +458,84 @@ class Connection:
         self._timeout = timeout
         self._closed = False
 
-        # Build auth header if credentials provided
-        self._auth_header: Optional[str] = None
-        if username and password:
-            credentials = f"{username}:{password}"
-            encoded = base64.b64encode(credentials.encode()).decode()
-            self._auth_header = f"Basic {encoded}"
+        # Token authentication settings
+        self._use_token_auth = use_token_auth and (username is not None and password is not None)
+        self._auto_refresh = auto_refresh
+
+        # Connection pool for HTTP connection reuse
+        self._pool = ConnectionPool(
+            host=host,
+            port=port,
+            use_ssl=use_ssl,
+            max_connections=max_connections,
+            timeout=timeout,
+        )
+
+        # Token manager for JWT token caching
+        self._token_manager = TokenManager(refresh_threshold=refresh_threshold)
+
+        # Lock for thread-safe login/refresh
+        self._auth_lock = threading.Lock()
+
+    def _ensure_valid_token(self) -> None:
+        """Ensure we have a valid access token, logging in or refreshing as needed."""
+        if not self._use_token_auth:
+            return
+
+        if not self._token_manager.needs_refresh():
+            return
+
+        with self._auth_lock:
+            # Double-check after acquiring lock
+            if not self._token_manager.needs_refresh():
+                return
+
+            if self._token_manager.has_token():
+                # Try to refresh
+                try:
+                    self._refresh_tokens()
+                    return
+                except Exception:
+                    # Refresh failed, try login
+                    pass
+
+            # Login to get new tokens
+            self._login()
+
+    def _login(self) -> None:
+        """Authenticate and get new tokens."""
+        if not self._username or not self._password:
+            raise AuthenticationError("Username and password required")
+
+        result = self._make_request_no_auth(
+            "POST",
+            "/api/v1/auth/login",
+            {"username": self._username, "password": self._password},
+        )
+
+        self._token_manager.set_tokens(
+            access_token=result["access_token"],
+            refresh_token=result["refresh_token"],
+            expires_at=result["expires_at"],
+        )
+
+    def _refresh_tokens(self) -> None:
+        """Refresh tokens using the refresh token."""
+        refresh_token = self._token_manager.get_refresh_token()
+        if not refresh_token:
+            raise AuthenticationError("No refresh token available")
+
+        result = self._make_request_no_auth(
+            "POST",
+            "/api/v1/auth/refresh",
+            {"refresh_token": refresh_token},
+        )
+
+        self._token_manager.set_tokens(
+            access_token=result["access_token"],
+            refresh_token=result["refresh_token"],
+            expires_at=result["expires_at"],
+        )
 
     def _make_request(
         self,
@@ -314,34 +543,93 @@ class Connection:
         path: str,
         body: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Make an HTTP request to the API."""
+        """Make an authenticated HTTP request to the API."""
         if self._closed:
             raise InterfaceError("Connection is closed")
 
-        # Create connection
-        if self._use_ssl:
-            conn = http.client.HTTPSConnection(
-                self._host, self._port, timeout=self._timeout
-            )
-        else:
-            conn = http.client.HTTPConnection(
-                self._host, self._port, timeout=self._timeout
-            )
+        # Ensure we have a valid token
+        if self._use_token_auth:
+            self._ensure_valid_token()
 
+        conn = self._pool.get_connection()
         try:
             # Build headers
             headers = {
                 "Content-Type": "application/json",
                 "Accept": "application/json",
+                "Connection": "keep-alive",
             }
-            if self._auth_header:
-                headers["Authorization"] = self._auth_header
+
+            # Add authentication
+            if self._use_token_auth:
+                token = self._token_manager.get_access_token()
+                headers["Authorization"] = f"Bearer {token}"
+            elif self._username and self._password:
+                credentials = f"{self._username}:{self._password}"
+                encoded = base64.b64encode(credentials.encode()).decode()
+                headers["Authorization"] = f"Basic {encoded}"
 
             # Make request
             body_json = json.dumps(body) if body else None
             conn.request(method, path, body=body_json, headers=headers)
 
             # Get response
+            response = conn.getresponse()
+            response_body = response.read().decode()
+
+            # Handle 401 - try to refresh and retry
+            if response.status == 401 and self._use_token_auth:
+                self._pool.return_connection(conn)
+                conn = None
+
+                with self._auth_lock:
+                    self._refresh_tokens()
+
+                # Retry with new token
+                return self._make_request(method, path, body)
+
+            if response_body:
+                result = json.loads(response_body)
+            else:
+                result = {}
+
+            if response.status >= 400:
+                error_msg = result.get("message", result.get("error", "Unknown error"))
+                raise DatabaseError(f"API error ({response.status}): {error_msg}")
+
+            # Return connection to pool
+            self._pool.return_connection(conn)
+            conn = None
+
+            return result
+
+        except http.client.HTTPException as e:
+            raise OperationalError(f"HTTP error: {e}")
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def _make_request_no_auth(
+        self,
+        method: str,
+        path: str,
+        body: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Make an HTTP request without authentication."""
+        conn = self._pool.get_connection()
+        try:
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "Connection": "keep-alive",
+            }
+
+            body_json = json.dumps(body) if body else None
+            conn.request(method, path, body=body_json, headers=headers)
+
             response = conn.getresponse()
             response_body = response.read().decode()
 
@@ -357,12 +645,19 @@ class Connection:
                 error_msg = result.get("message", result.get("error", "Unknown error"))
                 raise DatabaseError(f"API error ({response.status}): {error_msg}")
 
+            self._pool.return_connection(conn)
+            conn = None
+
             return result
 
         except http.client.HTTPException as e:
             raise OperationalError(f"HTTP error: {e}")
         finally:
-            conn.close()
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def _query(self, sql: str, params: List[Any]) -> QueryResult:
         """Execute a SELECT query."""
@@ -393,6 +688,35 @@ class Connection:
             execution_ms=result.get("execution_ms", 0),
         )
 
+    def login(self) -> None:
+        """
+        Explicitly login and cache tokens.
+
+        This is called automatically on first request when using token auth.
+        """
+        with self._auth_lock:
+            self._login()
+
+    def logout(self) -> None:
+        """Logout and revoke tokens."""
+        access_token = self._token_manager.get_access_token()
+        refresh_token = self._token_manager.get_refresh_token()
+
+        self._token_manager.clear()
+
+        if access_token or refresh_token:
+            try:
+                self._make_request_no_auth(
+                    "POST",
+                    "/api/v1/auth/logout",
+                    {
+                        "access_token": access_token or "",
+                        "refresh_token": refresh_token or "",
+                    },
+                )
+            except Exception:
+                pass  # Best effort logout
+
     def cursor(self) -> Cursor:
         """Create a new cursor."""
         return Cursor(self)
@@ -406,13 +730,15 @@ class Connection:
         pass
 
     def close(self) -> None:
-        """Close the connection."""
+        """Close the connection and release resources."""
         self._closed = True
+        self._pool.close_all()
+        self._token_manager.clear()
 
     def health(self) -> bool:
         """Check if the server is healthy."""
         try:
-            result = self._make_request("GET", "/health")
+            result = self._make_request_no_auth("GET", "/health")
             return result.get("status") == "ok"
         except Exception:
             return False
@@ -420,7 +746,8 @@ class Connection:
     def list_tables(self) -> List[str]:
         """List all tables."""
         result = self._make_request("GET", "/api/v1/tables")
-        return result.get("tables", [])
+        tables = result.get("tables")
+        return tables if tables is not None else []
 
     def create_table(self, schema: TableSchema) -> None:
         """Create a new table."""
@@ -502,26 +829,37 @@ def connect(
     username: Optional[str] = None,
     password: Optional[str] = None,
     timeout: float = 30.0,
+    use_token_auth: bool = True,
+    auto_refresh: bool = True,
+    max_connections: int = 10,
 ) -> Connection:
     """
-    Connect to a dbengine server.
+    Connect to a dbengine server with optimized settings.
 
     Args:
         url: The server URL (e.g., "http://localhost:8080")
-        username: Optional username for authentication
-        password: Optional password for authentication
+        username: Username for authentication
+        password: Password for authentication
         timeout: Request timeout in seconds
+        use_token_auth: Use JWT tokens instead of Basic Auth (default: True)
+        auto_refresh: Automatically refresh tokens before expiry (default: True)
+        max_connections: Maximum pooled connections (default: 10)
 
     Returns:
-        A Connection object
+        A Connection object with connection pooling and token caching
 
     Example:
+        # Simple usage - tokens are automatically managed
         conn = connect("http://localhost:8080", username="admin", password="secret")
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM my_table")
         for row in cursor.fetchall():
             print(row)
         conn.close()
+
+        # Disable token auth to use Basic Auth on every request
+        conn = connect("http://localhost:8080", username="admin", password="secret",
+                       use_token_auth=False)
     """
     # Parse URL
     if url.startswith("https://"):
@@ -550,6 +888,9 @@ def connect(
         password=password,
         use_ssl=use_ssl,
         timeout=timeout,
+        use_token_auth=use_token_auth,
+        auto_refresh=auto_refresh,
+        max_connections=max_connections,
     )
 
 

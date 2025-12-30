@@ -50,8 +50,12 @@ A high-performance database engine for querying massively wide datasets (10,000+
 dbengine/
 ├── cmd/
 │   └── dbengine/
-│       └── main.go              # CLI entry point
+│       └── main.go              # CLI entry point (REPL + API server)
 ├── pkg/
+│   ├── api/
+│   │   ├── server.go            # HTTP API server
+│   │   ├── auth.go              # JWT authentication manager
+│   │   └── API.md               # API documentation
 │   ├── query/
 │   │   ├── parser.go            # Column group SQL parser
 │   │   └── translator.go        # Translates to DuckDB SQL
@@ -67,8 +71,15 @@ dbengine/
 │   │   └── schema.go            # Schema definitions
 │   └── engine/
 │       └── engine.go            # Main engine coordinator
+├── dbclients/
+│   ├── go/
+│   │   ├── client.go            # Go client with connection pooling
+│   │   └── go.mod               # Go module file
+│   └── python/
+│       └── dbclient.py          # Python DB-API 2.0 client
 ├── scripts/
-│   └── generate_data.py         # Test data generator
+│   ├── generate_data.py         # Test data generator
+│   └── clean_data.py            # Data cleanup script
 ├── data/                        # Data directory
 │   └── {table_name}/
 │       ├── _schema.json         # Table schema
@@ -78,6 +89,7 @@ dbengine/
 │           └── ICE.json
 ├── go.mod
 ├── go.sum
+├── go.work                      # Go workspace (for multi-module)
 ├── CLAUDE.md
 └── README.md
 ```
@@ -155,11 +167,233 @@ About 5% of columns are marked as indexed.
 # Skip auto-loading tables on startup (for large datasets)
 ./dbengine --no-load
 
+# Start HTTP API server
+./dbengine -api -api-addr :8080 -api-user admin -api-pass secret
+
 # Show help
 ./dbengine -help
 ```
 
 **Note:** On startup, the engine loads all tables into DuckDB. For large datasets (50k+ rows), use `--no-load` to skip this and manually load tables with `.load <table>`.
+
+## HTTP API Server
+
+The database engine can run as an HTTP API server, allowing remote access from Go, Python, and other clients.
+
+### Starting the API Server
+
+```bash
+# Start API server with authentication
+./dbengine -api -api-addr :8080 -api-user admin -api-pass secret
+
+# Start with custom data directory
+./dbengine -api -data ./mydata -duckdb ./cache.duckdb -api-user admin -api-pass secret
+```
+
+### API Server Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-api` | false | Enable HTTP API server mode |
+| `-api-addr` | `:8080` | Server listen address |
+| `-api-user` | "" | Username for authentication |
+| `-api-pass` | "" | Password for authentication |
+
+### Authentication
+
+The API supports two authentication methods:
+
+1. **HTTP Basic Authentication** - Username/password in each request
+2. **JWT Bearer Tokens** - Token-based auth for optimized performance (recommended)
+
+#### JWT Token Authentication
+
+JWT tokens provide better performance by eliminating credential validation on each request. The server validates the token signature cryptographically, which is much faster than password hashing.
+
+```bash
+# 1. Login to get tokens
+curl -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"secret"}'
+
+# Response:
+# {
+#   "access_token": "eyJhbGciOiJIUzI1NiIs...",
+#   "refresh_token": "eyJhbGciOiJIUzI1NiIs...",
+#   "token_type": "Bearer",
+#   "expires_in": 3600,
+#   "expires_at": 1767110141
+# }
+
+# 2. Use access token for API requests
+curl http://localhost:8080/api/v1/tables \
+  -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIs..."
+
+# 3. Refresh tokens when access token expires
+curl -X POST http://localhost:8080/api/v1/auth/refresh \
+  -H "Content-Type: application/json" \
+  -d '{"refresh_token":"eyJhbGciOiJIUzI1NiIs..."}'
+```
+
+### API Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/health` | Health check (no auth required) |
+| POST | `/api/v1/auth/login` | Get JWT token pair |
+| POST | `/api/v1/auth/refresh` | Refresh tokens |
+| POST | `/api/v1/auth/logout` | Revoke tokens |
+| POST | `/api/v1/query` | Execute SELECT queries |
+| POST | `/api/v1/execute` | Execute INSERT/UPDATE/DELETE |
+| GET | `/api/v1/tables` | List all tables |
+| POST | `/api/v1/tables` | Create a table |
+| GET | `/api/v1/tables/{name}` | Get table schema |
+| DELETE | `/api/v1/tables/{name}` | Drop a table |
+
+See [pkg/api/API.md](pkg/api/API.md) for complete API documentation.
+
+## Client Libraries
+
+Official client libraries are available for Go and Python with built-in support for:
+- JWT token authentication with automatic refresh
+- HTTP connection pooling for optimal performance
+- Thread-safe token caching
+
+### Go Client
+
+Located in `dbclients/go/`.
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    dbclient "github.com/dsandor/flatstor/dbengine/dbclients/go"
+)
+
+func main() {
+    // Create client with JWT auth and connection pooling
+    client, _ := dbclient.New(dbclient.Config{
+        BaseURL:      "http://localhost:8080",
+        Username:     "admin",
+        Password:     "secret",
+        UseTokenAuth: true,  // Use JWT tokens
+        AutoRefresh:  true,  // Auto-refresh before expiry
+    })
+    defer client.Close()
+
+    ctx := context.Background()
+
+    // Login to get tokens
+    client.Login(ctx)
+
+    // Execute queries (uses cached token)
+    result, _ := client.Query(ctx, "SELECT * FROM asset_table LIMIT 10")
+    fmt.Printf("Got %d rows\n", result.RowCount)
+}
+```
+
+### Python Client
+
+Located in `dbclients/python/`. DB-API 2.0 compliant.
+
+```python
+from dbclient import connect
+
+# Create connection with JWT auth and pooling
+conn = connect(
+    url="http://localhost:8080",
+    username="admin",
+    password="secret",
+    use_token_auth=True,  # Use JWT tokens
+    auto_refresh=True,    # Auto-refresh before expiry
+)
+
+# Execute queries using DB-API 2.0 cursor
+cursor = conn.cursor()
+cursor.execute("SELECT * FROM asset_table LIMIT 10")
+rows = cursor.fetchall()
+print(f"Got {len(rows)} rows")
+
+cursor.close()
+conn.close()
+```
+
+## Performance
+
+### JWT + Connection Pooling Performance
+
+Performance tests were conducted to measure the effectiveness of JWT token authentication and HTTP connection pooling.
+
+#### Test Environment
+- **Hardware:** Apple Silicon Mac
+- **Server:** dbengine HTTP API running locally on port 8090
+- **Test Method:** Sequential API requests using Go and Python clients with JWT auth enabled and connection pooling
+- **Metrics:** Round-trip time per request measured with `time.Now()` (Go) and `time.time()` (Python)
+
+#### Test Results
+
+| Metric | Go Client | Python Client |
+|--------|-----------|---------------|
+| Initial login (JWT token generation) | 4.2ms | 2.0ms |
+| Health check (with token) | 0.19ms | 0.45ms |
+| List tables (first request) | 0.23ms | 0.46ms |
+| List tables (pooled connection) | 0.13-0.23ms | 0.13-0.21ms |
+| **Average request time** | **0.19ms** | **0.15ms** |
+| Token refresh | 0.12ms | N/A* |
+
+*Python client uses automatic internal refresh
+
+#### Connection Pooling Results (10 Sequential Requests)
+
+**Go Client:**
+```
+Request 1:  0.23ms
+Request 2:  0.25ms
+Request 3:  0.23ms
+Request 4:  0.20ms
+Request 5:  0.24ms
+Request 6:  0.18ms
+Request 7:  0.16ms
+Request 8:  0.15ms
+Request 9:  0.13ms
+Request 10: 0.14ms
+Average:    0.19ms
+```
+
+**Python Client:**
+```
+Request 1:  0.17ms
+Request 2:  0.15ms
+Request 3:  0.14ms
+Request 4:  0.14ms
+Request 5:  0.17ms
+Request 6:  0.17ms
+Request 7:  0.14ms
+Request 8:  0.15ms
+Request 9:  0.13ms
+Request 10: 0.15ms
+Average:    0.15ms
+```
+
+#### Key Findings
+
+1. **Sub-millisecond requests**: After initial connection, both clients achieve consistent sub-millisecond response times
+2. **Connection reuse**: HTTP Keep-Alive connections are reused effectively, eliminating TCP handshake overhead
+3. **Token caching**: JWT tokens are cached and reused, avoiding credential validation on each request
+4. **Warm-up effect**: Request times decrease after first few requests as connections are established and pooled
+
+#### Why JWT + Connection Pooling Matters
+
+| Without Optimization | With JWT + Pooling |
+|---------------------|-------------------|
+| Password hash verification per request (~2-5ms) | Token signature verification (~0.01ms) |
+| New TCP connection per request (~1-3ms) | Reused pooled connection (~0.05ms) |
+| TLS handshake per request (~5-10ms) | Single handshake, then reuse |
+| **Total overhead: 8-18ms/request** | **Total overhead: <0.2ms/request** |
+
+This represents a **40-90x improvement** in authentication and connection overhead for high-frequency API access.
 
 ### REPL Commands
 

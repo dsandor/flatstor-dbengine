@@ -27,13 +27,22 @@ type Config struct {
 	Addr     string // Listen address (e.g., ":8080")
 	Username string // Basic auth username
 	Password string // Basic auth password
+
+	// JWT token configuration
+	JWTSigningKey        string        // Secret key for signing tokens (optional, random if empty)
+	AccessTokenDuration  time.Duration // Access token validity (default: 1 hour)
+	RefreshTokenDuration time.Duration // Refresh token validity (default: 24 hours)
 }
 
 // New creates a new API server.
 func New(eng *engine.Engine, cfg Config) *Server {
 	s := &Server{
 		engine: eng,
-		auth:   NewAuthManager(cfg.Username, cfg.Password),
+		auth: NewAuthManagerWithConfig(cfg.Username, cfg.Password, TokenConfig{
+			SigningKey:           cfg.JWTSigningKey,
+			AccessTokenDuration:  cfg.AccessTokenDuration,
+			RefreshTokenDuration: cfg.RefreshTokenDuration,
+		}),
 	}
 
 	mux := http.NewServeMux()
@@ -41,7 +50,12 @@ func New(eng *engine.Engine, cfg Config) *Server {
 	// Health check (no auth required)
 	mux.HandleFunc("/health", s.handleHealth)
 
-	// API endpoints (auth required)
+	// Auth endpoints (login requires credentials, refresh requires valid refresh token)
+	mux.HandleFunc("/api/v1/auth/login", s.handleLogin)
+	mux.HandleFunc("/api/v1/auth/refresh", s.handleRefresh)
+	mux.HandleFunc("/api/v1/auth/logout", s.withAuth(s.handleLogout))
+
+	// API endpoints (auth required - supports both Basic Auth and Bearer token)
 	mux.HandleFunc("/api/v1/query", s.withAuth(s.handleQuery))
 	mux.HandleFunc("/api/v1/execute", s.withAuth(s.handleExecute))
 	mux.HandleFunc("/api/v1/tables", s.withAuth(s.handleTables))
@@ -50,13 +64,36 @@ func New(eng *engine.Engine, cfg Config) *Server {
 
 	s.httpServer = &http.Server{
 		Addr:         cfg.Addr,
-		Handler:      s.withLogging(mux),
+		Handler:      s.withLogging(s.withKeepAlive(mux)),
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 60 * time.Second,
 		IdleTimeout:  120 * time.Second,
 	}
 
+	// Start background token cleanup
+	go s.tokenCleanupLoop()
+
 	return s
+}
+
+// withKeepAlive ensures connection keep-alive headers are set.
+func (s *Server) withKeepAlive(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Enable keep-alive
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("Keep-Alive", "timeout=120, max=1000")
+		next.ServeHTTP(w, r)
+	})
+}
+
+// tokenCleanupLoop periodically cleans up expired revoked tokens.
+func (s *Server) tokenCleanupLoop() {
+	ticker := time.NewTicker(1 * time.Hour)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		s.auth.CleanupRevokedTokens()
+	}
 }
 
 // Start starts the HTTP server.
@@ -118,6 +155,119 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"status":  "ok",
 		"service": "dbengine",
 		"time":    time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+// LoginRequest represents a login request.
+type LoginRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+// handleLogin handles user login and returns JWT tokens.
+func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		s.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only POST is allowed")
+		return
+	}
+
+	var req LoginRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeError(w, http.StatusBadRequest, "invalid_json", "Invalid JSON body")
+		return
+	}
+
+	if req.Username == "" || req.Password == "" {
+		s.writeError(w, http.StatusBadRequest, "missing_credentials", "Username and password are required")
+		return
+	}
+
+	// Validate credentials
+	if !s.auth.AuthenticateCredentials(req.Username, req.Password) {
+		s.writeError(w, http.StatusUnauthorized, "invalid_credentials", "Invalid username or password")
+		return
+	}
+
+	// Generate token pair
+	tokens, err := s.auth.GenerateTokenPair(req.Username, []string{"read", "write"})
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, "token_error", "Failed to generate tokens")
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, tokens)
+}
+
+// RefreshRequest represents a token refresh request.
+type RefreshRequest struct {
+	RefreshToken string `json:"refresh_token"`
+}
+
+// handleRefresh handles token refresh requests.
+func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		s.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only POST is allowed")
+		return
+	}
+
+	var req RefreshRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeError(w, http.StatusBadRequest, "invalid_json", "Invalid JSON body")
+		return
+	}
+
+	if req.RefreshToken == "" {
+		s.writeError(w, http.StatusBadRequest, "missing_token", "Refresh token is required")
+		return
+	}
+
+	// Generate new token pair
+	tokens, err := s.auth.RefreshTokens(req.RefreshToken)
+	if err != nil {
+		s.writeError(w, http.StatusUnauthorized, "invalid_token", err.Error())
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, tokens)
+}
+
+// LogoutRequest represents a logout request.
+type LogoutRequest struct {
+	AccessToken  string `json:"access_token,omitempty"`
+	RefreshToken string `json:"refresh_token,omitempty"`
+}
+
+// handleLogout handles user logout by revoking tokens.
+func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		s.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only POST is allowed")
+		return
+	}
+
+	var req LogoutRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		// Allow empty body - just revoke the token from the header
+		req = LogoutRequest{}
+	}
+
+	// Revoke tokens if provided
+	if req.AccessToken != "" {
+		s.auth.RevokeToken(req.AccessToken)
+	}
+	if req.RefreshToken != "" {
+		s.auth.RevokeToken(req.RefreshToken)
+	}
+
+	// Also revoke the token used in the Authorization header
+	authHeader := r.Header.Get("Authorization")
+	if strings.HasPrefix(authHeader, "Bearer ") {
+		token := strings.TrimPrefix(authHeader, "Bearer ")
+		s.auth.RevokeToken(token)
+	}
+
+	s.writeJSON(w, http.StatusOK, map[string]any{
+		"success": true,
+		"message": "Logged out successfully",
 	})
 }
 
