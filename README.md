@@ -161,6 +161,149 @@ The script randomly assigns these types to columns:
 
 About 5% of columns are marked as indexed.
 
+### Memory-Efficient Data Generation
+
+When generating large datasets (100k+ rows or 1000+ columns), use these strategies to avoid running out of memory:
+
+#### Use Batch Mode
+
+The `--batch-size` option groups multiple rows into single files, reducing both memory usage and file I/O overhead:
+
+```bash
+# Generate 500,000 rows with 2,000 columns using batches of 1,000 rows
+python3 scripts/generate_data.py --rows 500000 --columns 2000 --batch-size 1000
+
+# For very large datasets, larger batch sizes are more efficient
+python3 scripts/generate_data.py --rows 1000000 --columns 5000 --batch-size 5000
+```
+
+**How batch mode helps:**
+- Writes multiple rows to a single JSONL file per column group, reducing file handle overhead
+- Triggers garbage collection after each batch to release memory
+- Shows progress with rows/sec metrics
+
+#### Single-Row Streaming Mode (Default)
+
+Without `--batch-size`, the script uses streaming writes that minimize memory:
+- Each row is written directly to disk without building the full row in memory
+- Garbage collection runs periodically (every 1000 rows or 1% of total, whichever is larger)
+- JSON is written incrementally to avoid large string allocations
+
+```bash
+# Default streaming mode - good for moderate datasets
+python3 scripts/generate_data.py --rows 50000 --columns 1000
+```
+
+### Parallel Data Generation
+
+For faster data generation, run multiple instances of the script in parallel. Each instance should generate a separate table that can be merged later, or use table partitioning.
+
+#### Method 1: Parallel Table Generation (Recommended)
+
+Generate multiple tables concurrently using shell parallelization:
+
+```bash
+# Generate 4 tables in parallel, each with 250,000 rows (total: 1M rows)
+for i in {0..3}; do
+  python3 scripts/generate_data.py \
+    --rows 250000 \
+    --columns 2000 \
+    --batch-size 1000 \
+    --table "assets_part_${i}" \
+    --seed $((42 + i)) &
+done
+wait
+
+echo "All partitions generated"
+```
+
+#### Method 2: Using GNU Parallel
+
+If you have GNU parallel installed, you can parallelize more elegantly:
+
+```bash
+# Install GNU parallel if needed: brew install parallel (macOS) or apt install parallel (Linux)
+
+# Generate 8 partitions across all CPU cores
+seq 0 7 | parallel -j8 \
+  python3 scripts/generate_data.py \
+    --rows 125000 \
+    --columns 2000 \
+    --batch-size 1000 \
+    --table "assets_part_{}" \
+    --seed {}
+```
+
+#### Method 3: Python Multiprocessing Wrapper
+
+Create a wrapper script for parallel generation:
+
+```python
+#!/usr/bin/env python3
+"""parallel_generate.py - Generate data in parallel using multiprocessing."""
+
+import subprocess
+import sys
+from multiprocessing import Pool, cpu_count
+
+def generate_partition(args):
+    partition_id, total_rows, columns, batch_size, base_table = args
+    rows_per_partition = total_rows // num_partitions
+
+    cmd = [
+        sys.executable, "scripts/generate_data.py",
+        "--rows", str(rows_per_partition),
+        "--columns", str(columns),
+        "--batch-size", str(batch_size),
+        "--table", f"{base_table}_part_{partition_id}",
+        "--seed", str(partition_id)
+    ]
+
+    subprocess.run(cmd, check=True)
+    return partition_id
+
+if __name__ == "__main__":
+    num_partitions = cpu_count()
+    total_rows = 1000000
+    columns = 2000
+    batch_size = 1000
+    base_table = "assets"
+
+    args_list = [
+        (i, total_rows, columns, batch_size, base_table)
+        for i in range(num_partitions)
+    ]
+
+    with Pool(num_partitions) as pool:
+        results = pool.map(generate_partition, args_list)
+
+    print(f"Generated {num_partitions} partitions with {total_rows} total rows")
+```
+
+Run with:
+```bash
+python3 parallel_generate.py
+```
+
+### Performance Guidelines
+
+| Dataset Size | Recommended Approach |
+|-------------|---------------------|
+| < 10k rows | Default streaming mode |
+| 10k - 100k rows | Batch mode (`--batch-size 1000`) |
+| 100k - 500k rows | Batch mode + 2-4 parallel instances |
+| 500k+ rows | Batch mode + parallel (one per CPU core) |
+
+**Memory estimates:**
+- Default mode: ~50MB per 10k rows with 1000 columns
+- Batch mode: ~20MB per batch regardless of total rows
+- Parallel mode: Memory usage per instance × number of instances
+
+**Disk space estimates:**
+- ~1KB per column group file (uncompressed JSON)
+- With 100 column groups × 100k rows = ~10GB
+- JSONL batch files are more compact (~30% smaller)
+
 ## Usage
 
 ### Command Line Options

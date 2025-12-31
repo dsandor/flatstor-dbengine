@@ -9,6 +9,17 @@ Usage:
 
 For large datasets (to avoid memory issues), use batch mode:
     python generate_data.py --rows 500000 --columns 2000 --batch-size 1000
+
+Append mode:
+    If the table already exists (schema file present), the script will append
+    new rows to the existing table using the existing schema. The --columns
+    and --groups options are ignored when appending.
+
+    # First run creates table with 100 rows
+    python generate_data.py --rows 100 --columns 50 --table my_table
+
+    # Second run appends 100 more rows (now 200 total)
+    python generate_data.py --rows 100 --table my_table
 """
 
 import argparse
@@ -218,6 +229,15 @@ def generate_batch_streaming(data_path: Path, table_name: str, schema: dict, bat
     return row_ids
 
 
+def load_existing_schema(data_path: Path, table_name: str) -> dict | None:
+    """Load an existing schema if it exists."""
+    schema_file = data_path / table_name / "_schema.json"
+    if schema_file.exists():
+        with open(schema_file, 'r') as f:
+            return json.load(f)
+    return None
+
+
 def write_schema(data_path: Path, schema: dict):
     """Write the schema file."""
     table_dir = data_path / schema["name"]
@@ -231,6 +251,15 @@ def write_schema(data_path: Path, schema: dict):
         json.dump(schema, f, indent=2)
 
     print(f"Created schema: {schema_file}")
+
+
+def update_schema_timestamp(data_path: Path, schema: dict):
+    """Update the schema's updated_at timestamp."""
+    schema_file = data_path / schema["name"] / "_schema.json"
+    schema["updated_at"] = datetime.now().astimezone().isoformat()
+
+    with open(schema_file, 'w') as f:
+        json.dump(schema, f, indent=2)
 
 
 def write_row(data_path: Path, table_name: str, row: dict):
@@ -308,21 +337,37 @@ def main():
 
     data_path = Path(args.data_path)
 
-    print(f"Generating data for table: {args.table}")
-    print(f"  Rows: {args.rows:,}")
-    print(f"  Columns: {args.columns:,}")
-    print(f"  Column Groups: {num_groups}")
-    print(f"  Data Path: {data_path.absolute()}")
-    print()
+    # Check for existing schema
+    existing_schema = load_existing_schema(data_path, args.table)
 
-    # Generate schema
-    print("Generating schema...")
-    schema = generate_schema(args.table, args.columns, num_groups)
-    write_schema(data_path, schema)
+    if existing_schema:
+        print(f"Appending data to existing table: {args.table}")
+        schema = existing_schema
+        total_cols = sum(len(g["columns"]) for g in schema["column_groups"])
+        num_groups = len(schema["column_groups"])
+        print(f"  Existing columns: {total_cols}")
+        print(f"  Existing groups: {num_groups}")
+        print(f"  Rows to add: {args.rows:,}")
+        print(f"  Data Path: {data_path.absolute()}")
+        print()
+        print("Note: --columns and --groups options ignored when appending to existing table")
+    else:
+        print(f"Creating new table: {args.table}")
+        print(f"  Rows: {args.rows:,}")
+        print(f"  Columns: {args.columns:,}")
+        print(f"  Column Groups: {num_groups}")
+        print(f"  Data Path: {data_path.absolute()}")
+        print()
 
-    # Count actual columns
-    total_cols = sum(len(g["columns"]) for g in schema["column_groups"])
-    print(f"  Total columns created: {total_cols}")
+        # Generate schema
+        print("Generating schema...")
+        schema = generate_schema(args.table, args.columns, num_groups)
+        write_schema(data_path, schema)
+
+        # Count actual columns
+        total_cols = sum(len(g["columns"]) for g in schema["column_groups"])
+        print(f"  Total columns created: {total_cols}")
+
     print()
 
     # Generate rows using streaming to minimize memory usage
@@ -370,6 +415,11 @@ def main():
                 print(f"  {i + 1:,} / {args.rows:,} rows ({rate:.1f} rows/sec)")
 
     elapsed = (datetime.now() - start_time).total_seconds()
+
+    # Update schema timestamp if we appended to existing table
+    if existing_schema:
+        update_schema_timestamp(data_path, schema)
+
     print()
     print(f"Done! Generated {args.rows:,} rows in {elapsed:.2f} seconds")
     print(f"  Rate: {args.rows / elapsed:.1f} rows/sec")
