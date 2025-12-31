@@ -1,5 +1,14 @@
 # Flatstor DBEngine
 
+[![Build Status](https://github.com/dsandor/flatstor-dbengine/actions/workflows/release.yml/badge.svg)](https://github.com/dsandor/flatstor-dbengine/actions/workflows/release.yml)
+[![Go Version](https://img.shields.io/github/go-mod/go-version/dsandor/flatstor-dbengine)](https://go.dev/)
+[![License](https://img.shields.io/badge/license-Source%20Available-blue.svg)](LICENSE.md)
+[![Release](https://img.shields.io/github/v/release/dsandor/flatstor-dbengine)](https://github.com/dsandor/flatstor-dbengine/releases)
+
+[![Docker Pulls](https://img.shields.io/docker/pulls/dsandor/flatstor-dbengine)](https://hub.docker.com/r/dsandor/flatstor-dbengine)
+[![Docker Image Size](https://img.shields.io/docker/image-size/dsandor/flatstor-dbengine/latest)](https://hub.docker.com/r/dsandor/flatstor-dbengine)
+[![Docker Image Version](https://img.shields.io/docker/v/dsandor/flatstor-dbengine?sort=semver)](https://hub.docker.com/r/dsandor/flatstor-dbengine)
+
 A high-performance database engine for querying massively wide datasets (10,000+ columns) with TSQL-style syntax, column group namespacing, and O(1) row lookups.
 
 ## Technology Stack
@@ -116,6 +125,92 @@ go build -o dbengine ./cmd/dbengine
 
 # Run tests
 go test ./...
+```
+
+## Docker
+
+The dbengine is available as a Docker container from both Docker Hub and GitHub Container Registry.
+
+### Pulling the Image
+
+```bash
+# From Docker Hub
+docker pull dsandor/flatstor-dbengine:latest
+
+# From GitHub Container Registry
+docker pull ghcr.io/dsandor/flatstor-dbengine:latest
+```
+
+### Running the Server
+
+Run the API server with a mounted data directory:
+
+```bash
+# Basic usage - mount local data directory to /data in container
+docker run -d \
+  -p 8080:8080 \
+  -v /path/to/your/data:/data \
+  -e API_USER=admin \
+  -e API_PASS=secret \
+  dsandor/flatstor-dbengine:latest
+
+# With persistent DuckDB cache
+docker run -d \
+  -p 8080:8080 \
+  -v /path/to/your/data:/data \
+  -v /path/to/cache:/cache \
+  -e API_USER=admin \
+  -e API_PASS=secret \
+  dsandor/flatstor-dbengine:latest \
+  -api -data /data -duckdb /cache/db.duckdb -api-addr :8080 -api-user admin -api-pass secret
+```
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DATA_PATH` | `/data` | Path to data directory inside container |
+| `DUCKDB_PATH` | "" | Path to persistent DuckDB file (optional) |
+| `API_ADDR` | `:8080` | API server listen address |
+| `API_USER` | "" | Username for API authentication |
+| `API_PASS` | "" | Password for API authentication |
+
+### Docker Compose Example
+
+```yaml
+version: '3.8'
+services:
+  dbengine:
+    image: dsandor/flatstor-dbengine:latest
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data
+      - ./cache:/cache
+    environment:
+      - API_USER=admin
+      - API_PASS=secret
+    command: ["-api", "-data", "/data", "-duckdb", "/cache/db.duckdb", "-api-addr", ":8080", "-api-user", "admin", "-api-pass", "secret"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+```
+
+### Verifying the Server
+
+```bash
+# Check health endpoint
+curl http://localhost:8080/health
+
+# Login and get JWT token
+curl -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"secret"}'
+
+# List tables (with Basic Auth)
+curl -u admin:secret http://localhost:8080/api/v1/tables
 ```
 
 ## Generating Test Data
